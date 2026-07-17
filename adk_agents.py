@@ -1,21 +1,16 @@
 import os
 import json
-from google.genai.types import HttpRetryOptions
-from google.adk.models.google_llm import Gemini
+import re
+import asyncio
+import threading
+from google.adk.models.lite_llm import LiteLlm
 from google.adk import Agent, Workflow, Context
-from google.adk.tools import ToolContext
 from google.adk.workflow import RetryConfig
 from routing_service import RoutingService
 
 # 1. Configuration & Service Setup
-MODEL = Gemini(
-    model="gemini-2.0-flash",
-    retry_options=HttpRetryOptions(
-        attempts=5,
-        initial_delay=1.0,
-        exp_base=2.0,
-        http_status_codes=[429, 500, 503, 504]
-    )
+MODEL = LiteLlm(
+    model="groq/llama-3.1-8b-instant"
 )
 
 agent_retry_config = RetryConfig(
@@ -38,121 +33,258 @@ routing_service = RoutingService(
     police_csv_path=POLICE_CSV_PATH
 )
 
-# 2. Tool & MCP Setup
-import sys
-from google.adk.tools import McpToolset
-from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
-from mcp import StdioServerParameters
+# 2. Deterministic Workflow Nodes
 
-mcp_server_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "safegrid_mcp_server.py")
+def route_planner_node(ctx: Context, node_input: str) -> str:
+    # Extract source and destination
+    source = "IGDTUW"
+    destination = "Connaught Place"
+    match = re.search(r"Source:\s*(.*?),\s*Destination:\s*(.*)", node_input, re.IGNORECASE)
+    if match:
+        source = match.group(1).strip()
+        destination = match.group(2).strip()
+        
+    from geopy.geocoders import Nominatim
+    geolocator = Nominatim(user_agent="safegrid")
+    
+    # Geocode start
+    query_start = source if "delhi" in source.lower() else f"{source}, Delhi"
+    try:
+        geo_start = geolocator.geocode(query_start)
+        if not geo_start:
+            raise ValueError(f"Source location '{source}' not found")
+    except Exception as e:
+        raise ValueError(f"Failed to geocode source '{source}': {str(e)}")
+        
+    # Geocode end
+    query_end = destination if "delhi" in destination.lower() else f"{destination}, Delhi"
+    try:
+        geo_end = geolocator.geocode(query_end)
+        if not geo_end:
+            raise ValueError(f"Destination location '{destination}' not found")
+    except Exception as e:
+        raise ValueError(f"Failed to geocode destination '{destination}': {str(e)}")
+        
+    res = routing_service.find_safest_route(
+        geo_start.latitude, geo_start.longitude,
+        geo_end.latitude, geo_end.longitude
+    )
+    serializable_res = {
+        "route_found": res["route_found"],
+        "distance_km": res["distance_km"],
+        "eta_min": res["eta_min"],
+        "eta_minutes": res["eta_min"],
+        "route_cells": res["route_cells"]
+    }
+    res_str = json.dumps(serializable_res)
+    ctx.state["route_info"] = res_str
+    return res_str
 
-# Create separate Toolsets with filters to enforce agent-to-tool mapping
-route_toolset = McpToolset(
-    connection_params=StdioConnectionParams(
-        server_params=StdioServerParameters(
-            command=sys.executable,
-            args=[mcp_server_path]
-        ),
-        timeout=30.0
-    ),
-    tool_filter=["get_safe_route"]
-)
+def crime_analyzer_node(ctx: Context) -> str:
+    route_info_str = ctx.state.get("route_info", "{}")
+    route_info = json.loads(route_info_str)
+    cells = route_info.get("route_cells", [])
+    
+    # Risk analysis
+    if not cells:
+        risk_score = 0
+        risk_level = "UNKNOWN"
+    else:
+        scores = [c["safety_score"] for c in cells]
+        avg_safety = sum(scores) / len(scores)
+        risk_score = int(round((1 - avg_safety) * 100))
+        if risk_score < 30:
+            risk_level = "LOW"
+        elif risk_score < 60:
+            risk_level = "MEDIUM"
+        else:
+            risk_level = "HIGH"
+            
+    # Hotspot detection
+    hotspots = []
+    risky_cells = [c for c in cells if c.get("safety_score", 1.0) < 0.5]
+    df_m = routing_service.location_df
+    for cell in risky_cells:
+        lat = cell.get("lat") or cell.get("latitude")
+        lon = cell.get("lon") or cell.get("longitude")
+        safety_score = cell.get("safety_score", 0.0)
+        if lat is not None and lon is not None:
+            dist_sq = (df_m['Latitude'] - float(lat))**2 + (df_m['Longitude'] - float(lon))**2
+            idx = dist_sq.idxmin()
+            closest_station = df_m.loc[idx]['Station Names']
+            risk_desc = "High" if safety_score < 0.3 else "Moderate"
+            hotspots.append(f"{closest_station} Area — {risk_desc} Risk")
+    unique_hotspots = []
+    for h in hotspots:
+        if h not in unique_hotspots:
+            unique_hotspots.append(h)
+    unique_hotspots = unique_hotspots[:5]
+    
+    res = {
+        "risk_score": risk_score,
+        "risk_level": risk_level,
+        "hotspots": unique_hotspots
+    }
+    res_str = json.dumps(res)
+    ctx.state["risk_info"] = res_str
+    return res_str
 
-crime_toolset = McpToolset(
-    connection_params=StdioConnectionParams(
-        server_params=StdioServerParameters(
-            command=sys.executable,
-            args=[mcp_server_path]
-        ),
-        timeout=30.0
-    ),
-    tool_filter=["analyze_route_risk", "detect_hotspots"]
-)
+def police_on_route_node(ctx: Context) -> str:
+    route_info_str = ctx.state.get("route_info", "{}")
+    route_info = json.loads(route_info_str)
+    cells = route_info.get("route_cells", [])
+    if not cells or len(cells) < 2:
+        res_str = "[]"
+    else:
+        from shapely.geometry import Point, LineString
+        import geopandas as gpd
+        import pandas as pd
+        
+        route_coords = []
+        for c in cells:
+            if isinstance(c, dict):
+                lat = c.get("lat") or c.get("latitude")
+                lon = c.get("lon") or c.get("longitude")
+                if lat is not None and lon is not None:
+                    route_coords.append((float(lon), float(lat)))
+                    
+        if len(route_coords) < 2:
+            res_str = "[]"
+        else:
+            route_line = LineString(route_coords)
+            gdf_route = gpd.GeoDataFrame(geometry=[route_line], crs="EPSG:4326")
+            gdf_route_proj = gdf_route.to_crs(epsg=32643)
+            route_geom_proj = gdf_route_proj.geometry.iloc[0]
+            
+            df_p = routing_service.police_df
+            gdf_police = gpd.GeoDataFrame(
+                df_p,
+                geometry=gpd.points_from_xy(df_p["Longitude"], df_p["Latitude"]),
+                crs="EPSG:4326"
+            )
+            gdf_police_proj = gdf_police.to_crs(epsg=32643)
+            distances_m = gdf_police_proj.geometry.distance(route_geom_proj)
+            
+            df_p = df_p.copy()
+            df_p["distance_m"] = distances_m
+            nearby_df = df_p[df_p["distance_m"] <= 1000.0].copy()
+            nearby_df = nearby_df.sort_values(by="distance_m")
+            nearby_df = nearby_df.drop_duplicates(subset=["Police Station"], keep="first")
+            
+            nearby_stations = []
+            for _, row in nearby_df.iterrows():
+                nearby_stations.append({
+                    "name": str(row["Police Station"]),
+                    "lat": float(row["Latitude"]),
+                    "lon": float(row["Longitude"]),
+                    "distance_m": float(row["distance_m"])
+                })
+            res_str = json.dumps(nearby_stations)
+            
+    ctx.state["emergency_output"] = res_str
+    return res_str
 
-recommendation_toolset = McpToolset(
-    connection_params=StdioConnectionParams(
-        server_params=StdioServerParameters(
-            command=sys.executable,
-            args=[mcp_server_path]
-        ),
-        timeout=30.0
-    ),
-    tool_filter=["get_safety_recommendation"]
-)
+def geocode_node(ctx: Context, node_input: str) -> str:
+    location = node_input
+    match = re.search(r"User Location:\s*(.*)", node_input, re.IGNORECASE)
+    if match:
+        location = match.group(1).strip()
+        
+    from geopy.geocoders import Nominatim
+    geolocator = Nominatim(user_agent="safegrid")
+    query_loc = location if "delhi" in location.lower() else f"{location}, Delhi"
+    try:
+        geo_loc = geolocator.geocode(query_loc)
+        if not geo_loc:
+            lat, lon = 28.6304, 77.2177
+        else:
+            lat, lon = geo_loc.latitude, geo_loc.longitude
+    except Exception:
+        lat, lon = 28.6304, 77.2177
+        
+    coords = {"lat": lat, "lon": lon, "location_name": location}
+    coords_str = json.dumps(coords)
+    ctx.state["coordinates"] = coords_str
+    return coords_str
 
-emergency_toolset = McpToolset(
-    connection_params=StdioConnectionParams(
-        server_params=StdioServerParameters(
-            command=sys.executable,
-            args=[mcp_server_path]
-        ),
-        timeout=30.0
-    ),
-    tool_filter=["nearest_police_station", "nearest_metro", "nearest_hospital", "find_police_on_route"]
-)
+def emergency_lookup_node(ctx: Context) -> str:
+    coords_str = ctx.state.get("coordinates", "{}")
+    coords = json.loads(coords_str)
+    lat = coords.get("lat", 28.6304)
+    lon = coords.get("lon", 77.2177)
+    
+    # 1. Nearest Police Station
+    df_p = routing_service.police_df
+    dist_sq_p = (df_p['Latitude'] - lat)**2 + (df_p['Longitude'] - lon)**2
+    idx_p = dist_sq_p.idxmin()
+    closest_p = df_p.loc[idx_p]
+    police_data = {
+        "name": closest_p['Police Station'],
+        "lat": float(closest_p['Latitude']),
+        "lon": float(closest_p['Longitude'])
+    }
+    
+    # 2. Nearest Metro
+    df_m = routing_service.location_df
+    dist_sq_m = (df_m['Latitude'] - lat)**2 + (df_m['Longitude'] - lon)**2
+    idx_m = dist_sq_m.idxmin()
+    closest_m = df_m.loc[idx_m]
+    metro_data = {
+        "name": closest_m['Station Names'],
+        "line": closest_m['Metro Line'],
+        "lat": float(closest_m['Latitude']),
+        "lon": float(closest_m['Longitude'])
+    }
+    
+    # 3. Nearest Hospital
+    hospitals = [
+        {"name": "Lok Nayak Hospital", "lat": 28.6366, "lon": 77.2407},
+        {"name": "Dr. Ram Manohar Lohia Hospital", "lat": 28.6253, "lon": 77.2007},
+        {"name": "AIIMS New Delhi", "lat": 28.5672, "lon": 77.2100},
+        {"name": "Max Super Speciality Hospital, Shalimar Bagh", "lat": 28.7180, "lon": 77.1585},
+        {"name": "Sir Ganga Ram Hospital", "lat": 28.6385, "lon": 77.1895}
+    ]
+    closest_h = min(hospitals, key=lambda h: (h['lat'] - lat)**2 + (h['lon'] - lon)**2)
+    
+    res = {
+        "nearest_police": police_data,
+        "nearest_metro": metro_data,
+        "nearest_hospital": closest_h,
+        "location_name": coords.get("location_name", "User Location")
+    }
+    res_str = json.dumps(res)
+    ctx.state["emergency_info_json"] = res_str
+    return res_str
 
 # 3. Agent Declarations
 
-route_agent = Agent(
-    name="RouteAgent",
+safety_agent = Agent(
+    name="SafetyAgent",
     model=MODEL,
-    description="Handles geocoding and route planning.",
+    description="Generates final user-facing safety suggestions and route analysis summary.",
     instruction="""
-    You are the Route Intelligence Agent. Your job is to plan the safest route between two places.
-    1. Parse the input string which describes the query (e.g., 'Source: X, Destination: Y').
-    2. Extract the source and destination names.
-    3. Call the `get_safe_route` tool using these source and destination names.
-    4. Save the output string returned by `get_safe_route` as a JSON string inside the 'route_info' key in state.
-    5. Return exactly the JSON string generated by the `get_safe_route` tool.
-    """,
-    tools=[route_toolset],
-    output_key="route_info",
-    retry_config=agent_retry_config
-)
+    You are the Route Safety Recommendation Agent.
+    
+    You will receive in your context state:
+    - `route_info`: A JSON string containing the planned route details (distance_km, eta_min, etc.).
+    - `risk_info`: A JSON string containing the risk_score (0-100), risk_level (LOW, MEDIUM, HIGH), and active crime hotspots.
+    - `emergency_output`: A JSON string representing a list of nearby police stations along the route with their distances.
 
-crime_agent = Agent(
-    name="CrimeAgent",
-    model=MODEL,
-    description="Analyzes crime risk levels for a route.",
-    instruction="""
-    You are the Crime Analysis Agent.
-    1. Read 'route_info' from context state. It contains a JSON with 'route_cells'.
-    2. Extract the list of 'route_cells'.
-    3. Pass the cells JSON as a JSON string to `analyze_route_risk` to determine the risk percentage score and risk level (LOW/MEDIUM/HIGH).
-    4. Pass the cells JSON as a JSON string to `detect_hotspots` to get a list of active crime hotspots.
-    5. Output the result as a single JSON string containing:
-       - risk_score: risk percentage (0-100)
-       - risk_level: string (LOW, MEDIUM, HIGH)
-       - hotspots: list of strings
-       Weave the calculations from both tools into this single JSON output.
+    Your job is to generate a clean, reassuring, and user-friendly summary of the route safety assessment in Markdown format.
+    
+    Please include:
+    1. ### Safety Assessment
+       - **Route Summary**: Summarize the route distance (in km) and ETA (in minutes).
+       - **Risk Level**: State the risk level (LOW/MEDIUM/HIGH) with an appropriate emoji.
+       - **Risk Score**: Show the safety risk score (0-100%).
+    2. ### Nearby Police Stations Along Route
+       - List the names of unique police stations near the route with their distances in meters.
+       - If the list is empty, state: 'No police stations found within 1km of the route.'
+    3. ### Active Crime Hotspots
+       - List any hotspots found. If none, state: 'No major crime hotspots detected along this route.'
+    4. ### Safety Advice & Recommendations
+       - Give tailored, actionable safety precautions based on the risk level (e.g. share live location, prefer Metro for high-risk routes, stay on lit roads).
     """,
-    tools=[crime_toolset],
-    output_key="risk_info",
-    retry_config=agent_retry_config
-)
-
-recommendation_agent = Agent(
-    name="RecommendationAgent",
-    model=MODEL,
-    description="Generates final user-facing safety suggestions.",
-    instruction="""
-    You are the Recommendation Agent. Your job is to format the final user safety advice.
-    1. Read 'route_info', 'risk_info', and 'emergency_output' from context state.
-    2. Call `get_safety_recommendation` using the risk_score and risk_level from state.
-    3. Generate a clean, user-friendly summary of the route path, safety recommendation, and nearby police stations in Markdown format.
-    4. For example:
-       ### Safety Assessment
-       - **Route Summary**: Route found from [Source] to [Destination]. Distance: [Distance] km. ETA: [ETA] mins.
-       - **Risk Level**: [Risk Level (e.g. HIGH)]
-       - **Risk Score**: [Risk Score (e.g. 78%)]
-       
-       ### Nearby Police Stations Along Route
-       [Format a bulleted list of unique police stations from 'emergency_output' JSON, showing distance in meters. If no police stations are present or the list is empty, state: 'No police stations found within 1km of the route.']
-       
-       ### Safety Advice & Recommendations
-       - [List safety recommendations here]
-    """,
-    tools=[recommendation_toolset],
     output_key="final_recommendation",
     retry_config=agent_retry_config
 )
@@ -160,20 +292,23 @@ recommendation_agent = Agent(
 emergency_agent = Agent(
     name="EmergencyAgent",
     model=MODEL,
-    description="Finds nearby emergency services and police stations along a route.",
+    description="Formats final emergency SOS response.",
     instruction="""
-    You are the Emergency Agent.
-    1. Check if 'route_info' is present in the context state.
-       - If 'route_info' is present, extract 'route_cells' from it (it contains a list of cells).
-       - Call the `find_police_on_route` tool using these route cells.
-       - Return exactly the JSON string returned by the `find_police_on_route` tool.
-    2. If 'route_info' is NOT present in the context state, read the input query which describes the user's location (e.g. 'User Location: X').
-       - Extract the location name or coordinates.
-       - Use your internal geographical knowledge to estimate the latitude and longitude coordinates of that location.
-       - Call `nearest_police_station`, `nearest_metro`, and `nearest_hospital` using the coordinates.
-       - Generate a final response in Markdown format, listing the nearest services and 3 quick safety advice steps for an SOS situation.
+    You are the Emergency Response formatting agent.
+    
+    You will receive in your context state:
+    - `emergency_info_json`: A JSON string with details of the nearest emergency services (police, metro, hospital).
+
+    Your job is to generate a clean, clear, and reassuring emergency SOS response in Markdown format.
+    
+    Include:
+    1. ### 🚨 Emergency Safety Services near the user location:
+       - **Nearest Police Station**: Name and coordinates.
+       - **Nearest Metro Station**: Name and Line color (with coordinates).
+       - **Nearest Hospital**: Name and coordinates.
+    2. ### 🛡️ Quick Safety Advice for SOS Situations:
+       - List 3 quick, actionable safety advice steps for an SOS situation (e.g., move to a public place, share live location, call 112/100).
     """,
-    tools=[emergency_toolset],
     output_key="emergency_output",
     retry_config=agent_retry_config
 )
@@ -195,7 +330,7 @@ def return_safety_output(ctx: Context) -> dict:
             police_on_route = []
     except:
         police_on_route = []
-    
+        
     return {
         "route_found": route_info.get("route_found", False),
         "distance_km": route_info.get("distance_km", 0.0),
@@ -216,18 +351,20 @@ def return_emergency_output(ctx: Context) -> dict:
 safety_workflow = Workflow(
     name="SafetyWorkflow",
     edges=[
-        ("START", route_agent),
-        (route_agent, crime_agent),
-        (crime_agent, emergency_agent),
-        (emergency_agent, recommendation_agent),
-        (recommendation_agent, return_safety_output)
+        ("START", route_planner_node),
+        (route_planner_node, crime_analyzer_node),
+        (crime_analyzer_node, police_on_route_node),
+        (police_on_route_node, safety_agent),
+        (safety_agent, return_safety_output)
     ]
 )
 
 emergency_workflow = Workflow(
     name="EmergencyWorkflow",
     edges=[
-        ("START", emergency_agent),
+        ("START", geocode_node),
+        (geocode_node, emergency_lookup_node),
+        (emergency_lookup_node, emergency_agent),
         (emergency_agent, return_emergency_output)
     ]
 )

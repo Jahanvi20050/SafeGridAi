@@ -31,8 +31,6 @@ class RoutingService:
             self.data = json.load(file)
         self.df = pd.DataFrame(self.data)
         self.df.rename(columns={'longitude': 'Longitude', 'latitude': 'Latitude'}, inplace=True)
-        self.df["Longitude"] = self.df["Longitude"].round(2)
-        self.df["Latitude"] = self.df["Latitude"].round(2)
 
         # 2. Build Projected KDTree for exact meter-based distance crime queries
         gdf_crime = gpd.GeoDataFrame(
@@ -45,8 +43,6 @@ class RoutingService:
 
         # 3. Load Metro Dataset
         self.location_df = pd.read_csv(self.metro_path)
-        self.location_df["Longitude"] = self.location_df["Longitude"].round(2)
-        self.location_df["Latitude"] = self.location_df["Latitude"].round(2)
 
         # 4. Load Police Stations Dataset
         self.police_df = pd.read_csv(self.police_csv_path)
@@ -146,6 +142,7 @@ class RoutingService:
 
             # 4. Query KDTree: count crimes within 250m
             radius_meters = 250.0
+            #Har road node ke aas paas 250 meter ke andar kitne crimes hain?
             counts = [len(indices) for indices in self.crime_tree.query_ball_point(node_coords_projected, r=radius_meters)]
             max_count = max(counts) if counts else 1
 

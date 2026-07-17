@@ -11,8 +11,25 @@ if os.path.isdir(subfolder) and subfolder not in sys.path:
 
 import asyncio
 import pandas as pd
+import threading
+
+def run_in_thread(coro):
+    res_list = []
+    err_list = []
+    def target():
+        try:
+            res = asyncio.run(coro)
+            res_list.append(res)
+        except Exception as e:
+            err_list.append(e)
+    t = threading.Thread(target=target)
+    t.start()
+    t.join()
+    if err_list:
+        raise err_list[0]
+    return res_list[0]
 import numpy as np
-import geopandas as gpd
+import geopandas as gpd 
 import folium
 from streamlit_folium import st_folium
 import streamlit as st
@@ -487,7 +504,11 @@ def local_safety_solver(start_location, destination):
         
     # Hotspots
     hotspots = []
-    risky_cells = [c for c in cells if c.get("safety_score", 1.0) < 0.5]
+    risky_cells = []
+
+    for c in cells:
+        if c.get("safety_score", 1.0) < 0.5:
+            risky_cells.append(c)
     df_m = routing_service.location_df
     for cell in risky_cells:
         lat = cell.get("lat")
@@ -658,8 +679,8 @@ Based on local spatial database queries:
     }
 
 # API Key Validation
-if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
-    st.warning("⚠️ **API Key Missing**: Please set `GEMINI_API_KEY` or `GOOGLE_API_KEY` in a `.env` file or environment variables. System will use local offline routing engine.")
+if not os.getenv("GROQ_API_KEY"):
+    st.warning("⚠️ **API Key Missing**: Please set `GROQ_API_KEY` in a `.env` file or environment variables. System will use local offline routing engine.")
 
 # Create tabs
 tab1, tab2 = st.tabs(["🛣️ Route Safety Planner", "🚨 Emergency SOS Locator"])
@@ -686,13 +707,14 @@ with tab1:
                     try:
                         runner = InMemoryRunner(node=safety_workflow)
                         # Run workflow asynchronously
-                        events = asyncio.run(runner.run_debug(f"Source: {start_location}, Destination: {destination}"))
+                        events = run_in_thread(runner.run_debug(f"Source: {start_location}, Destination: {destination}"))
                         
                         # Extract final workflow output
                         output_event = next((e for e in reversed(events) if e.output is not None), None)
                         res = output_event.output if output_event else None
                     except Exception as agent_err:
-                        st.info("ℹ️ **Gemini API Limit Reached**: Computing route & safety parameters locally.")
+                        st.exception(agent_err)
+                        st.info("ℹ️ **Groq API Limit Reached**: Computing route & safety parameters locally.")
                         res = local_safety_solver(start_location, destination)
                         
                     if not res or not isinstance(res, dict):
@@ -783,12 +805,19 @@ with tab1:
                         
                         # Add police stations near the route
                         for ps in res.get("police_on_route", []):
+                            popup_html = f"""
+                            <div style="font-family: 'Outfit', sans-serif; font-size: 12px; width: 130px; padding: 2px; line-height: 1.2;">
+                                <strong style="color: #1E3A8A;">🚓 Police Station</strong><br/>
+                                <span style="color: #4B5563;">{ps['name']}</span><br/>
+                                <small style="color: #9CA3AF;">{ps['distance_m']:.0f}m away</small>
+                            </div>
+                            """
                             folium.Marker(
                                 [ps["lat"], ps["lon"]],
-                                popup=f"Police Station: {ps['name']} ({ps['distance_m']:.0f}m from route)",
+                                popup=folium.Popup(popup_html, max_width=140),
                                 icon=folium.Icon(color='blue', icon='shield')
                             ).add_to(m_grid)
-                        
+                            
                         st_folium(
                             m_grid,
                             width=None,
@@ -928,12 +957,13 @@ with tab2:
                     res = None
                     try:
                         runner = InMemoryRunner(node=emergency_workflow)
-                        events = asyncio.run(runner.run_debug(f"User Location: {user_location}"))
+                        events = run_in_thread(runner.run_debug(f"User Location: {user_location}"))
                         
                         output_event = next((e for e in reversed(events) if e.output is not None), None)
                         res = output_event.output if output_event else None
                     except Exception as agent_err:
-                        st.info("ℹ️ **Gemini API Limit Reached**: Fetching nearby emergency services locally.")
+                        st.exception(agent_err)
+                        st.info("ℹ️ **Groq API Limit Reached**: Fetching nearby emergency services locally.")
                         res = local_emergency_solver(user_location)
                         
                     if not res or not isinstance(res, dict):
@@ -964,9 +994,15 @@ with tab2:
                                 df_p = routing_service.police_df
                                 dist_sq = (df_p['Latitude'] - user_lat)**2 + (df_p['Longitude'] - user_lon)**2
                                 closest_p = df_p.loc[dist_sq.idxmin()]
+                                popup_p_html = f"""
+                                <div style="font-family: 'Outfit', sans-serif; font-size: 12px; width: 130px; padding: 2px; line-height: 1.2;">
+                                    <strong style="color: #1E3A8A;">🚓 Police Station</strong><br/>
+                                    <span style="color: #4B5563;">{closest_p['Police Station']}</span>
+                                </div>
+                                """
                                 folium.Marker(
                                     [closest_p['Latitude'], closest_p['Longitude']],
-                                    popup=f"Police: {closest_p['Police Station']}",
+                                    popup=folium.Popup(popup_p_html, max_width=140),
                                     icon=folium.Icon(color='blue', icon='shield')
                                 ).add_to(m_sos)
                             except:
@@ -977,9 +1013,15 @@ with tab2:
                                 df_m = routing_service.location_df
                                 dist_sq = (df_m['Latitude'] - user_lat)**2 + (df_m['Longitude'] - user_lon)**2
                                 closest_m = df_m.loc[dist_sq.idxmin()]
+                                popup_m_html = f"""
+                                <div style="font-family: 'Outfit', sans-serif; font-size: 12px; width: 130px; padding: 2px; line-height: 1.2;">
+                                    <strong style="color: #6D28D9;">🚇 Metro Station</strong><br/>
+                                    <span style="color: #4B5563;">{closest_m['Station Names']}</span>
+                                </div>
+                                """
                                 folium.Marker(
                                     [closest_m['Latitude'], closest_m['Longitude']],
-                                    popup=f"Metro: {closest_m['Station Names']}",
+                                    popup=folium.Popup(popup_m_html, max_width=140),
                                     icon=folium.Icon(color='purple', icon='subway')
                                 ).add_to(m_sos)
                             except:
@@ -994,11 +1036,18 @@ with tab2:
                                 {"name": "Sir Ganga Ram Hospital", "lat": 28.6385, "lon": 77.1895}
                             ]
                             closest_h = min(hospitals, key=lambda h: (h['lat'] - user_lat)**2 + (h['lon'] - user_lon)**2)
+                            popup_h_html = f"""
+                            <div style="font-family: 'Outfit', sans-serif; font-size: 12px; width: 130px; padding: 2px; line-height: 1.2;">
+                                <strong style="color: #047857;">🏥 Hospital</strong><br/>
+                                <span style="color: #4B5563;">{closest_h['name']}</span>
+                            </div>
+                            """
                             folium.Marker(
                                 [closest_h['lat'], closest_h['lon']],
-                                popup=f"Hospital: {closest_h['name']} (Stub)",
+                                popup=folium.Popup(popup_h_html, max_width=140),
                                 icon=folium.Icon(color='green', icon='plus-sign')
                             ).add_to(m_sos)
+                            
                             
                             st.markdown('<div class="custom-card" style="padding: 1.5rem 1.5rem 0.5rem 1.5rem;"><div class="insight-header">🗺️ Nearest Services Map</div>', unsafe_allow_html=True)
                             st_folium(

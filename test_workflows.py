@@ -1,5 +1,7 @@
 import asyncio
 import sys
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
 import os
 import json
 import logging
@@ -8,7 +10,7 @@ from dotenv import load_dotenv
 # Configure logging to see MCP details and stack traces
 logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
 
-# Load env variables including GEMINI_API_KEY
+# Load env variables including GROQ_API_KEY
 load_dotenv(override=True)
 
 # Ensure the workspace directory is in the path

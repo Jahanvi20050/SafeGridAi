@@ -34,6 +34,7 @@ async def get_safe_route(source: str, destination: str) -> str:
         geo_start = geolocator.geocode(query_start)
         if not geo_start:
             return json.dumps({"route_found": False, "error": f"Source location '{source}' not found"})
+        #json.dumps() Python me Python object ko JSON string me convert karta hai.
     except Exception as e:
         return json.dumps({"route_found": False, "error": f"Failed to geocode source: {str(e)}"})
         
