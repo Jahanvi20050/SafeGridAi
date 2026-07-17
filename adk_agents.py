@@ -21,10 +21,14 @@ agent_retry_config = RetryConfig(
     jitter=1.0
 )
 
-CRIME_PATH = r"C:\Users\dell\OneDrive\Documents\JN\all syllabussss\discrete mathematics\semester 4\crime_dataset (1) (1).json"
-METRO_PATH = r"C:\Users\dell\OneDrive\Documents\JN\all syllabussss\discrete mathematics\semester 4\Delhi metro.csv"
-BOUNDARY_PATH = r"C:\Users\dell\OneDrive\Documents\JN\all syllabussss\discrete mathematics\semester 4\Delhi_Boundary.geojson"
-POLICE_CSV_PATH = r"c:\Users\dell\OneDrive\Documents\JN\all syllabussss\discrete mathematics\semester 4\delhi_police_station_locs.csv"
+# Resolve paths relative to the current file (adk_agents.py is in SafeGridAi/)
+base_dir = os.path.dirname(os.path.abspath(__file__))
+data_dir = os.path.join(base_dir, "data")
+
+CRIME_PATH = os.path.join(data_dir, "crime_dataset (1) (1).json")
+METRO_PATH = os.path.join(data_dir, "Delhi metro.csv")
+BOUNDARY_PATH = os.path.join(data_dir, "Delhi_Boundary.geojson")
+POLICE_CSV_PATH = os.path.join(data_dir, "delhi_police_station_locs.csv")
 
 routing_service = RoutingService(
     crime_path=CRIME_PATH,

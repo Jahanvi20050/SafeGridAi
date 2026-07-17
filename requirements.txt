@@ -1,0 +1,16 @@
+streamlit
+streamlit-folium
+folium
+pandas
+numpy
+geopandas
+shapely
+networkx
+scipy
+osmnx
+geopy
+google-adk
+litellm
+python-dotenv
+matplotlib
+mcp
