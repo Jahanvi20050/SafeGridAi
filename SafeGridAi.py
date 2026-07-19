@@ -5,7 +5,8 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
-subfolder = os.path.join(current_dir, "women_safety_route_app")
+parent_dir = os.path.dirname(current_dir)
+subfolder = os.path.join(parent_dir, "women_safety_route_app")
 if os.path.isdir(subfolder) and subfolder not in sys.path:
     sys.path.append(subfolder)
 
@@ -467,20 +468,46 @@ def local_safety_solver(start_location, destination):
     from geopy.geocoders import Nominatim
     from shapely.geometry import LineString
     import json
+    import re
     
-    geolocator = Nominatim(user_agent="safegrid")
+    def parse_coords(text):
+        match = re.search(r"([+-]?\d+\.\d+),\s*([+-]?\d+\.\d+)", text)
+        if match:
+            try:
+                return float(match.group(1)), float(match.group(2))
+            except ValueError:
+                pass
+        return None
     
     # Geocode start
-    query_start = start_location if "delhi" in start_location.lower() else f"{start_location}, Delhi"
-    geo_start = geolocator.geocode(query_start)
-    if not geo_start:
-        raise ValueError(f"Start location '{start_location}' not found")
+    parsed_start = parse_coords(start_location)
+    if parsed_start:
+        class GeoLocationStart:
+            def __init__(self, lat, lon):
+                self.latitude = lat
+                self.longitude = lon
+        geo_start = GeoLocationStart(parsed_start[0], parsed_start[1])
+    else:
+        geolocator = Nominatim(user_agent="safegrid")
+        query_start = start_location if "delhi" in start_location.lower() else f"{start_location}, Delhi"
+        geo_start = geolocator.geocode(query_start)
+        if not geo_start:
+            raise ValueError(f"Start location '{start_location}' not found")
         
     # Geocode destination
-    query_end = destination if "delhi" in destination.lower() else f"{destination}, Delhi"
-    geo_end = geolocator.geocode(query_end)
-    if not geo_end:
-        raise ValueError(f"Destination location '{destination}' not found")
+    parsed_end = parse_coords(destination)
+    if parsed_end:
+        class GeoLocationEnd:
+            def __init__(self, lat, lon):
+                self.latitude = lat
+                self.longitude = lon
+        geo_end = GeoLocationEnd(parsed_end[0], parsed_end[1])
+    else:
+        geolocator = Nominatim(user_agent="safegrid")
+        query_end = destination if "delhi" in destination.lower() else f"{destination}, Delhi"
+        geo_end = geolocator.geocode(query_end)
+        if not geo_end:
+            raise ValueError(f"Destination location '{destination}' not found")
         
     # Call routing service
     res = routing_service.find_safest_route(
@@ -607,13 +634,27 @@ def local_safety_solver(start_location, destination):
 # Local Fallback Emergency Solver
 def local_emergency_solver(user_location):
     from geopy.geocoders import Nominatim
-    geolocator = Nominatim(user_agent="safegrid")
-    query = user_location if "delhi" in user_location.lower() else f"{user_location}, Delhi"
-    geo = geolocator.geocode(query)
-    if not geo:
-        raise ValueError(f"Could not locate user location '{user_location}'")
+    import re
+    
+    def parse_coords(text):
+        match = re.search(r"([+-]?\d+\.\d+),\s*([+-]?\d+\.\d+)", text)
+        if match:
+            try:
+                return float(match.group(1)), float(match.group(2))
+            except ValueError:
+                pass
+        return None
         
-    user_lat, user_lon = geo.latitude, geo.longitude
+    parsed_loc = parse_coords(user_location)
+    if parsed_loc:
+        user_lat, user_lon = parsed_loc
+    else:
+        geolocator = Nominatim(user_agent="safegrid")
+        query = user_location if "delhi" in user_location.lower() else f"{user_location}, Delhi"
+        geo = geolocator.geocode(query)
+        if not geo:
+            raise ValueError(f"Could not locate user location '{user_location}'")
+        user_lat, user_lon = geo.latitude, geo.longitude
     
     # 1. Find nearest police station
     df_p = routing_service.police_df
@@ -681,383 +722,433 @@ Based on local spatial database queries:
 # API Key Validation
 if not os.getenv("GROQ_API_KEY"):
     st.warning("⚠️ **API Key Missing**: Please set `GROQ_API_KEY` in a `.env` file or environment variables. System will use local offline routing engine.")
+from location_search_helper import search_nominatim
 
-# Create tabs
+# Initialize session state variables for autocomplete search
+if "start_coords" not in st.session_state:
+    st.session_state["start_coords"] = (28.6653, 77.2323)
+if "start_name" not in st.session_state:
+    st.session_state["start_name"] = "IGDTUW"
+if "dest_coords" not in st.session_state:
+    st.session_state["dest_coords"] = (28.6304, 77.2177)
+if "dest_name" not in st.session_state:
+    st.session_state["dest_name"] = "Connaught Place"
+if "sos_coords" not in st.session_state:
+    st.session_state["sos_coords"] = (28.6304, 77.2177)
+if "sos_name" not in st.session_state:
+    st.session_state["sos_name"] = "Connaught Place"
+
 tab1, tab2 = st.tabs(["🛣️ Route Safety Planner", "🚨 Emergency SOS Locator"])
 
 with tab1:
-    with st.form("route_form"):
+    with st.container(border=True):
         st.markdown('<div style="font-family:\'Outfit\', sans-serif; font-size:1.4rem; font-weight:700; color:#1E293B; margin-bottom:1.5rem;">🗺️ Route Safe-Planner</div>', unsafe_allow_html=True)
         col1, col2 = st.columns(2)
         with col1:
-            start_location = st.text_input("Start Location", value="IGDTUW", key="route_start")
+            start_query = st.text_input("Start Location (Search)", value="IGDTUW", key="start_query_input")
+            if len(start_query) >= 3:
+                suggestions = search_nominatim(start_query)
+                if isinstance(suggestions, list) and suggestions:
+                    options = [s["display_name"] for s in suggestions]
+                    selected_opt = st.selectbox("Select Start Match", options=options, key="start_select")
+                    sel_item = next(s for s in suggestions if s["display_name"] == selected_opt)
+                    st.session_state["start_coords"] = (float(sel_item["lat"]), float(sel_item["lon"]))
+                    st.session_state["start_name"] = sel_item["display_name"]
+                elif suggestions in ("RATE_LIMIT_ERROR", "API_ERROR", "NETWORK_ERROR"):
+                    st.error("⚠️ Unable to search locations right now. Please try again.")
+                else:
+                    st.warning("📍 No matching place found. Please enter a different location or landmark.")
+            else:
+                st.info("ℹ️ Type at least 3 characters to search.")
+                
         with col2:
-            destination = st.text_input("Destination", value="Connaught Place", key="route_dest")
+            dest_query = st.text_input("Destination (Search)", value="Connaught Place", key="dest_query_input")
+            if len(dest_query) >= 3:
+                suggestions = search_nominatim(dest_query)
+                if isinstance(suggestions, list) and suggestions:
+                    options = [s["display_name"] for s in suggestions]
+                    selected_opt = st.selectbox("Select Destination Match", options=options, key="dest_select")
+                    sel_item = next(s for s in suggestions if s["display_name"] == selected_opt)
+                    st.session_state["dest_coords"] = (float(sel_item["lat"]), float(sel_item["lon"]))
+                    st.session_state["dest_name"] = sel_item["display_name"]
+                elif suggestions in ("RATE_LIMIT_ERROR", "API_ERROR", "NETWORK_ERROR"):
+                    st.error("⚠️ Unable to search locations right now. Please try again.")
+                else:
+                    st.warning("📍 No matching place found. Please enter a different location or landmark.")
+            else:
+                st.info("ℹ️ Type at least 3 characters to search.")
             
-        # Form Submit Button
-        btn_route_submitted = st.form_submit_button("Generate Safe Route")
+        btn_route_submitted = st.button("Generate Safe Route", key="btn_route_submit")
         
     if btn_route_submitted:
-        if not start_location or not destination:
-            st.error("Please enter both Start Location and Destination.")
-        else:
-            with st.spinner("AI agents are negotiating and planning your route..."):
+        start_location = st.session_state["start_name"]
+        destination = st.session_state["dest_name"]
+        workflow_source = f"{st.session_state['start_coords'][0]}, {st.session_state['start_coords'][1]} ({start_location})"
+        workflow_destination = f"{st.session_state['dest_coords'][0]}, {st.session_state['dest_coords'][1]} ({destination})"
+        
+        with st.spinner("AI agents are negotiating and planning your route..."):
+            try:
+                res = None
                 try:
-                    res = None
-                    try:
-                        runner = InMemoryRunner(node=safety_workflow)
-                        # Run workflow asynchronously
-                        events = run_in_thread(runner.run_debug(f"Source: {start_location}, Destination: {destination}"))
-                        
-                        # Extract final workflow output
-                        output_event = next((e for e in reversed(events) if e.output is not None), None)
-                        res = output_event.output if output_event else None
-                    except Exception as agent_err:
-                        st.exception(agent_err)
-                        st.info("ℹ️ **Groq API Limit Reached**: Computing route & safety parameters locally.")
-                        res = local_safety_solver(start_location, destination)
-                        
-                    if not res or not isinstance(res, dict):
-                        st.error("No valid response from agents or local fallback solver.")
-                    elif not res.get("route_found", False):
-                        st.error("Route not found between the specified locations. Please try again.")
+                    runner = InMemoryRunner(node=safety_workflow)
+                    # Run workflow asynchronously
+                    events = run_in_thread(runner.run_debug(f"Source: {workflow_source}, Destination: {workflow_destination}"))
+                    
+                    # Extract final workflow output
+                    output_event = next((e for e in reversed(events) if e.output is not None), None)
+                    res = output_event.output if output_event else None
+                except Exception as agent_err:
+                    st.exception(agent_err)
+                    st.info("ℹ️ **Groq API Limit Reached**: Computing route & safety parameters locally.")
+                    res = local_safety_solver(workflow_source, workflow_destination)
+                    
+                if not res or not isinstance(res, dict):
+                    st.error("No valid response from agents or local fallback solver.")
+                elif not res.get("route_found", False):
+                    st.error("Route not found between the specified locations. Please try again.")
+                else:
+                    if "local" in res.get("recommendation", "").lower():
+                        st.success("Safe route computed successfully via local fallback engine!")
                     else:
-                        if "local" in res.get("recommendation", "").lower():
-                            st.success("Safe route computed successfully via local fallback engine!")
-                        else:
-                            st.success("Safe route computed successfully!")
+                        st.success("Safe route computed successfully!")
+                    
+                    # Display Route Metrics (Custom Beautiful Cards)
+                    risk_lvl = res['risk_level'].upper()
+                    risk_cls = "risk-low"
+                    if "MEDIUM" in risk_lvl:
+                        risk_cls = "risk-medium"
+                    elif "HIGH" in risk_lvl or "DANGER" in risk_lvl:
+                        risk_cls = "risk-high"
                         
-                        # Display Route Metrics (Custom Beautiful Cards)
-                        risk_lvl = res['risk_level'].upper()
-                        risk_cls = "risk-low"
-                        if "MEDIUM" in risk_lvl:
-                            risk_cls = "risk-medium"
-                        elif "HIGH" in risk_lvl or "DANGER" in risk_lvl:
-                            risk_cls = "risk-high"
-                            
-                        metrics_html = f"""
-                        <div class="metric-container">
-                            <div class="metric-card distance">
-                                <div class="metric-label">
-                                    <span class="metric-icon">🛣️</span> Total Distance
-                                </div>
-                                <div class="metric-value">{res['distance_km']} km</div>
-                                <div class="metric-subtitle">Optimized safety routing distance</div>
+                    metrics_html = f"""
+                    <div class="metric-container">
+                        <div class="metric-card distance">
+                            <div class="metric-label">
+                                <span class="metric-icon">🛣️</span> Total Distance
                             </div>
-                            <div class="metric-card eta">
-                                <div class="metric-label">
-                                    <span class="metric-icon">⏱️</span> Estimated Time (ETA)
-                                </div>
-                                <div class="metric-value">{res['eta_min']} mins</div>
-                                <div class="metric-subtitle">Based on road networks & conditions</div>
+                            <div class="metric-value">{res['distance_km']} km</div>
+                            <div class="metric-subtitle">Optimized safety routing distance</div>
+                        </div>
+                        <div class="metric-card eta">
+                            <div class="metric-label">
+                                <span class="metric-icon">⏱️</span> Estimated Time (ETA)
                             </div>
-                            <div class="metric-card {risk_cls}">
-                                <div class="metric-label">
-                                    <span class="metric-icon">🛡️</span> Safety Level / Risk
-                                </div>
-                                <div class="metric-value">{res['risk_level']} <span style="font-size: 1.1rem; font-weight:500; color:#64748B;">({res['risk_score']}% risk)</span></div>
-                                <div class="metric-subtitle">Multi-agent evaluated route threat index</div>
+                            <div class="metric-value">{res['eta_min']} mins</div>
+                            <div class="metric-subtitle">Based on road networks & conditions</div>
+                        </div>
+                        <div class="metric-card {risk_cls}">
+                            <div class="metric-label">
+                                <span class="metric-icon">🛡️</span> Safety Level / Risk
                             </div>
+                            <div class="metric-value">{res['risk_level']} <span style="font-size: 1.1rem; font-weight:500; color:#64748B;">({res['risk_score']}% risk)</span></div>
+                            <div class="metric-subtitle">Multi-agent evaluated route threat index</div>
+                        </div>
+                    </div>
+                    """
+                    st.markdown(metrics_html, unsafe_allow_html=True)
+                    
+                    # Map section: Main Hero card
+                    st.markdown('<div class="custom-card" style="padding: 1.5rem 1.5rem 0.5rem 1.5rem;"><div class="insight-header">🗺️ SafeGrid Interactive Route Map</div>', unsafe_allow_html=True)
+                    
+                    # Render Folium Map
+                    # Get start coordinate from first cell
+                    cells = res["route_cells"]
+                    start_lat, start_lon = cells[0]["lat"], cells[0]["lon"]
+                    end_lat, end_lon = cells[-1]["lat"], cells[-1]["lon"]
+                    
+                    m_grid = folium.Map(location=[start_lat, start_lon], zoom_start=13)
+                    
+                    # Add boundary
+                    folium.GeoJson(
+                        routing_service.gdf_boundary.to_crs(epsg=4326),
+                        style_function=lambda x: {"color": "black", "weight": 2, "fillOpacity": 0}
+                    ).add_to(m_grid)
+                    
+                    # Add Grid colored by safety score
+                    grid_gdf_4326 = routing_service.grid_gdf.to_crs(epsg=4326).copy()
+                    grid_gdf_4326["color"] = grid_gdf_4326["safety_score"].apply(
+                        lambda s: '#%02x%02x%02x' % tuple(int(255 * c) for c in cm.RdYlGn(s)[:3])
+                    )
+                    
+                    folium.GeoJson(
+                        grid_gdf_4326.__geo_interface__,
+                        style_function=lambda feature: {
+                            "fillColor": feature["properties"]["color"],
+                            "color": "black",
+                            "weight": 0.2,
+                            "fillOpacity": 0.4
+                        }
+                    ).add_to(m_grid)
+                    
+                    # Add route PolyLine
+                    route_coords = [(c["lat"], c["lon"]) for c in cells]
+                    folium.PolyLine(route_coords, color="blue", weight=5, opacity=0.8, tooltip="Safest Route").add_to(m_grid)
+                    
+                    # Add markers
+                    folium.Marker([start_lat, start_lon], popup=f"Start: {start_location}", icon=folium.Icon(color='green', icon='play')).add_to(m_grid)
+                    folium.Marker([end_lat, end_lon], popup=f"End: {destination}", icon=folium.Icon(color='red', icon='stop')).add_to(m_grid)
+                    
+                    # Add police stations near the route
+                    for ps in res.get("police_on_route", []):
+                        popup_html = f"""
+                        <div style="font-family: 'Outfit', sans-serif; font-size: 12px; width: 130px; padding: 2px; line-height: 1.2;">
+                            <strong style="color: #1E3A8A;">🚓 Police Station</strong><br/>
+                            <span style="color: #4B5563;">{ps['name']}</span><br/>
+                            <small style="color: #9CA3AF;">{ps['distance_m']:.0f}m away</small>
                         </div>
                         """
-                        st.markdown(metrics_html, unsafe_allow_html=True)
-                        
-                        # Map section: Main Hero card
-                        st.markdown('<div class="custom-card" style="padding: 1.5rem 1.5rem 0.5rem 1.5rem;"><div class="insight-header">🗺️ SafeGrid Interactive Route Map</div>', unsafe_allow_html=True)
-                        
-                        # Render Folium Map
-                        # Get start coordinate from first cell
-                        cells = res["route_cells"]
-                        start_lat, start_lon = cells[0]["lat"], cells[0]["lon"]
-                        end_lat, end_lon = cells[-1]["lat"], cells[-1]["lon"]
-                        
-                        m_grid = folium.Map(location=[start_lat, start_lon], zoom_start=13)
-                        
-                        # Add boundary
-                        folium.GeoJson(
-                            routing_service.gdf_boundary.to_crs(epsg=4326),
-                            style_function=lambda x: {"color": "black", "weight": 2, "fillOpacity": 0}
+                        folium.Marker(
+                            [ps["lat"], ps["lon"]],
+                            popup=folium.Popup(popup_html, max_width=140),
+                            icon=folium.Icon(color='blue', icon='shield')
                         ).add_to(m_grid)
                         
-                        # Add Grid colored by safety score
-                        grid_gdf_4326 = routing_service.grid_gdf.to_crs(epsg=4326).copy()
-                        grid_gdf_4326["color"] = grid_gdf_4326["safety_score"].apply(
-                            lambda s: '#%02x%02x%02x' % tuple(int(255 * c) for c in cm.RdYlGn(s)[:3])
-                        )
-                        
-                        folium.GeoJson(
-                            grid_gdf_4326.__geo_interface__,
-                            style_function=lambda feature: {
-                                "fillColor": feature["properties"]["color"],
-                                "color": "black",
-                                "weight": 0.2,
-                                "fillOpacity": 0.4
-                            }
-                        ).add_to(m_grid)
-                        
-                        # Add route PolyLine
-                        route_coords = [(c["lat"], c["lon"]) for c in cells]
-                        folium.PolyLine(route_coords, color="blue", weight=5, opacity=0.8, tooltip="Safest Route").add_to(m_grid)
-                        
-                        # Add markers
-                        folium.Marker([start_lat, start_lon], popup=f"Start: {start_location}", icon=folium.Icon(color='green', icon='play')).add_to(m_grid)
-                        folium.Marker([end_lat, end_lon], popup=f"End: {destination}", icon=folium.Icon(color='red', icon='stop')).add_to(m_grid)
-                        
-                        # Add police stations near the route
-                        for ps in res.get("police_on_route", []):
-                            popup_html = f"""
-                            <div style="font-family: 'Outfit', sans-serif; font-size: 12px; width: 130px; padding: 2px; line-height: 1.2;">
-                                <strong style="color: #1E3A8A;">🚓 Police Station</strong><br/>
-                                <span style="color: #4B5563;">{ps['name']}</span><br/>
-                                <small style="color: #9CA3AF;">{ps['distance_m']:.0f}m away</small>
-                            </div>
-                            """
-                            folium.Marker(
-                                [ps["lat"], ps["lon"]],
-                                popup=folium.Popup(popup_html, max_width=140),
-                                icon=folium.Icon(color='blue', icon='shield')
-                            ).add_to(m_grid)
-                            
-                        st_folium(
-                            m_grid,
-                            width=None,
-                            height=550,
-                            returned_objects=[],
-                            key="safety_map",
-                            use_container_width=True
-                        )
-                        st.markdown('</div>', unsafe_allow_html=True)
-                        
-                        # Parse advice bullets
-                        advice_bullets = []
-                        rec_text = res.get("recommendation", "")
-                        if "Safety Advice & Recommendations" in rec_text:
-                            parts = rec_text.split("Safety Advice & Recommendations")
-                            advice_part = parts[-1]
-                            for line in advice_part.split("\n"):
-                                line_s = line.strip()
-                                if line_s.startswith("-") or line_s.startswith("*"):
-                                    advice_bullets.append(line_s.lstrip("-* ").strip())
-                        if not advice_bullets:
-                            advice_bullets = [
-                                "Stay on main roads and avoid deserted pathways.",
-                                "Keep your phone active and emergency contacts on speed dial.",
-                                "Share your real-time ETA and route tracking with family."
-                            ]
-                        
-                        # Parse hotspots
-                        hotspots = res.get('hotspots', [])
-                        hotspots_text = "None detected on route" if not hotspots else "<br/>".join(hotspots)
-                        
-                        # Construct Assessment Html (flat strings with no leading indentation on each line)
-                        assessment_html = (
-                            f'<div class="insight-item">'
-                            f'<div class="insight-content">'
-                            f'<div class="insight-title">Safety Confidence</div>'
-                            f'<div class="insight-desc">The path is evaluated to be <strong>{100 - res["risk_score"]}% Secure</strong>.</div>'
-                            f'</div>'
-                            f'</div>'
-                            f'<div class="insight-item">'
-                            f'<div class="insight-content">'
-                            f'<div class="insight-title">Active Threat Hotspots</div>'
-                            f'<div class="insight-desc">{hotspots_text}</div>'
-                            f'</div>'
-                            f'</div>'
-                        )
-                        
-                        # Construct Police Html (flat strings with no leading indentation on each line)
-                        police_html = ""
-                        police_list = res.get("police_on_route", [])
-                        if police_list:
-                            for ps in police_list[:3]: # Show top 3
-                                police_html += (
-                                    f'<div class="insight-item">'
-                                    f'<span class="insight-icon">🚓</span>'
-                                    f'<div class="insight-content">'
-                                    f'<div class="insight-title">{ps["name"]}</div>'
-                                    f'<span class="police-badge">{ps["distance_m"]:.0f}m from route</span>'
-                                    f'</div>'
-                                    f'</div>'
-                                )
-                        else:
-                            police_html = (
+                    st_folium(
+                        m_grid,
+                        width=None,
+                        height=550,
+                        returned_objects=[],
+                        key="safety_map",
+                        use_container_width=True
+                    )
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    # Parse advice bullets
+                    advice_bullets = []
+                    rec_text = res.get("recommendation", "")
+                    if "Safety Advice & Recommendations" in rec_text:
+                        parts = rec_text.split("Safety Advice & Recommendations")
+                        advice_part = parts[-1]
+                        for line in advice_part.split("\n"):
+                            line_s = line.strip()
+                            if line_s.startswith("-") or line_s.startswith("*"):
+                                advice_bullets.append(line_s.lstrip("-* ").strip())
+                    if not advice_bullets:
+                        advice_bullets = [
+                            "Stay on main roads and avoid deserted pathways.",
+                            "Keep your phone active and emergency contacts on speed dial.",
+                            "Share your real-time ETA and route tracking with family."
+                        ]
+                    
+                    # Parse hotspots
+                    hotspots = res.get('hotspots', [])
+                    hotspots_text = "None detected on route" if not hotspots else "<br/>".join(hotspots)
+                    
+                    # Construct Assessment Html
+                    assessment_html = (
+                        f'<div class="insight-item">'
+                        f'<div class="insight-content">'
+                        f'<div class="insight-title">Safety Confidence</div>'
+                        f'<div class="insight-desc">The path is evaluated to be <strong>{100 - res["risk_score"]}% Secure</strong>.</div>'
+                        f'</div>'
+                        f'</div>'
+                        f'<div class="insight-item">'
+                        f'<div class="insight-content">'
+                        f'<div class="insight-title">Active Threat Hotspots</div>'
+                        f'<div class="insight-desc">{hotspots_text}</div>'
+                        f'</div>'
+                        f'</div>'
+                    )
+                    
+                    # Construct Police Html
+                    police_html = ""
+                    police_list = res.get("police_on_route", [])
+                    if police_list:
+                        for ps in police_list[:3]:
+                            police_html += (
                                 f'<div class="insight-item">'
-                                f'<span class="insight-icon">⚠️</span>'
+                                f'<span class="insight-icon">🚓</span>'
                                 f'<div class="insight-content">'
-                                f'<div class="insight-title">No Stations Detected</div>'
-                                f'<div class="insight-desc">No police stations found within 1km of the route cells.</div>'
+                                f'<div class="insight-title">{ps["name"]}</div>'
+                                f'<span class="police-badge">{ps["distance_m"]:.0f}m from route</span>'
                                 f'</div>'
                                 f'</div>'
                             )
-                            
-                        # Construct Advice Html (flat strings with no leading indentation on each line)
-                        recommendation_html = ""
-                        icons = ["✅", "📞", "📍", "💡"]
-                        for idx, advice in enumerate(advice_bullets[:3]):
-                            icon = icons[idx % len(icons)]
-                            recommendation_html += (
-                                f'<div class="insight-item">'
-                                f'<span class="insight-icon">{icon}</span>'
-                                f'<div class="insight-content">'
-                                f'<div class="insight-desc" style="color:#334155; font-weight:500; font-size:0.95rem; margin-top:0;">{advice}</div>'
-                                f'</div>'
-                                f'</div>'
-                            )
-                            
-                        # Display Safety Insights Grid
-                        st.markdown('<h3 style="font-family:\'Outfit\', sans-serif; font-weight:700; color:#1E293B; margin-top:2.5rem; margin-bottom:1rem;">🛡️ SafeGrid Route Insights</h3>', unsafe_allow_html=True)
-                        ins_col1, ins_col2, ins_col3 = st.columns(3)
+                    else:
+                        police_html = (
+                            f'<div class="insight-item">'
+                            f'<span class="insight-icon">⚠️</span>'
+                            f'<div class="insight-content">'
+                            f'<div class="insight-title">No Stations Detected</div>'
+                            f'<div class="insight-desc">No police stations found within 1km of the route cells.</div>'
+                            f'</div>'
+                            f'</div>'
+                        )
                         
-                        with ins_col1:
-                            st.markdown(
-                                f'<div class="insight-card">'
-                                f'<div class="insight-header">📊 Safety Assessment</div>'
-                                f'<div class="insight-content">{assessment_html}</div>'
-                                f'</div>',
-                                unsafe_allow_html=True
-                            )
-                            
-                        with ins_col2:
-                            st.markdown(
-                                f'<div class="insight-card">'
-                                f'<div class="insight-header">🚓 Nearby Police Stations</div>'
-                                f'<div class="insight-content">{police_html}</div>'
-                                f'</div>',
-                                unsafe_allow_html=True
-                            )
-                            
-                        with ins_col3:
-                            st.markdown(
-                                f'<div class="insight-card">'
-                                f'<div class="insight-header">💡 Safety Recommendations</div>'
-                                f'<div class="insight-content">{recommendation_html}</div>'
-                                f'</div>',
-                                unsafe_allow_html=True
-                            )
-                            
-                except Exception as e:
-                    st.error(f"Error during route planning: {e}")
+                    # Construct Advice Html
+                    recommendation_html = ""
+                    icons = ["✅", "📞", "📍", "💡"]
+                    for idx, advice in enumerate(advice_bullets[:3]):
+                        icon = icons[idx % len(icons)]
+                        recommendation_html += (
+                            f'<div class="insight-item">'
+                            f'<span class="insight-icon">{icon}</span>'
+                            f'<div class="insight-content">'
+                            f'<div class="insight-desc" style="color:#334155; font-weight:500; font-size:0.95rem; margin-top:0;">{advice}</div>'
+                            f'</div>'
+                            f'</div>'
+                        )
+                        
+                    # Display Safety Insights Grid
+                    st.markdown('<h3 style="font-family:\'Outfit\', sans-serif; font-weight:700; color:#1E293B; margin-top:2.5rem; margin-bottom:1rem;">🛡️ SafeGrid Route Insights</h3>', unsafe_allow_html=True)
+                    ins_col1, ins_col2, ins_col3 = st.columns(3)
+                    
+                    with ins_col1:
+                        st.markdown(
+                            f'<div class="insight-card">'
+                            f'<div class="insight-header">📊 Safety Assessment</div>'
+                            f'<div class="insight-content">{assessment_html}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                        
+                    with ins_col2:
+                        st.markdown(
+                            f'<div class="insight-card">'
+                            f'<div class="insight-header">🚓 Nearby Police Stations</div>'
+                            f'<div class="insight-content">{police_html}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                        
+                    with ins_col3:
+                        st.markdown(
+                            f'<div class="insight-card">'
+                            f'<div class="insight-header">💡 Safety Recommendations</div>'
+                            f'<div class="insight-content">{recommendation_html}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+            except Exception as e:
+                st.error(f"Error during route planning: {e}")
 
 with tab2:
-    with st.form("sos_form"):
+    with st.container(border=True):
         st.markdown('<div style="font-family:\'Outfit\', sans-serif; font-size:1.4rem; font-weight:700; color:#DC2626; margin-bottom:1.5rem;">🚨 Emergency Help & SOS Locator</div>', unsafe_allow_html=True)
-        user_location = st.text_input("Enter Your Current Location or Nearby Landmark", value="Connaught Place", key="sos_loc")
-        
+        sos_query = st.text_input("Enter Your Current Location or Nearby Landmark (Search)", value="Connaught Place", key="sos_query_input")
+        if len(sos_query) >= 3:
+            suggestions = search_nominatim(sos_query)
+            if isinstance(suggestions, list) and suggestions:
+                options = [s["display_name"] for s in suggestions]
+                selected_opt = st.selectbox("Select Location Match", options=options, key="sos_select")
+                sel_item = next(s for s in suggestions if s["display_name"] == selected_opt)
+                st.session_state["sos_coords"] = (float(sel_item["lat"]), float(sel_item["lon"]))
+                st.session_state["sos_name"] = sel_item["display_name"]
+            elif suggestions in ("RATE_LIMIT_ERROR", "API_ERROR", "NETWORK_ERROR"):
+                st.error("⚠️ Unable to search locations right now. Please try again.")
+            else:
+                st.warning("📍 No matching place found. Please enter a different location or landmark.")
+        else:
+            st.info("ℹ️ Type at least 3 characters to search.")
+            
         # Pulse-animated button container
         st.markdown('<div class="sos-btn-container">', unsafe_allow_html=True)
-        btn_sos_submitted = st.form_submit_button("Activate SOS & Find Help")
+        btn_sos_submitted = st.button("Activate SOS & Find Help", key="btn_sos_submit")
         st.markdown('</div>', unsafe_allow_html=True)
         
     if btn_sos_submitted:
-        if not user_location:
-            st.error("Please enter your location.")
-        else:
-            with st.spinner("Emergency Agent is locating nearest help stations..."):
+        user_location = st.session_state["sos_name"]
+        workflow_user_location = f"{st.session_state['sos_coords'][0]}, {st.session_state['sos_coords'][1]} ({user_location})"
+        
+        with st.spinner("Emergency Agent is locating nearest help stations..."):
+            try:
+                res = None
                 try:
-                    res = None
+                    runner = InMemoryRunner(node=emergency_workflow)
+                    events = run_in_thread(runner.run_debug(f"User Location: {workflow_user_location}"))
+                    
+                    output_event = next((e for e in reversed(events) if e.output is not None), None)
+                    res = output_event.output if output_event else None
+                except Exception as agent_err:
+                    st.exception(agent_err)
+                    st.info("ℹ️ **Groq API Limit Reached**: Fetching nearby emergency services locally.")
+                    res = local_emergency_solver(workflow_user_location)
+                    
+                if not res or not isinstance(res, dict):
+                    st.error("Emergency Agent did not return a valid response and local fallback failed.")
+                else:
+                    # Wrap emergency information in a styled container
+                    st.markdown(f'<div class="sos-output-container">\n\n{res["emergency_info"]}\n\n</div>', unsafe_allow_html=True)
+                    
+                    # Use coordinates directly (bypassing geocoding)
+                    user_lat, user_lon = st.session_state["sos_coords"]
+                    m_sos = folium.Map(location=[user_lat, user_lon], zoom_start=14)
+                    
+                    # User marker
+                    folium.Marker(
+                        [user_lat, user_lon], 
+                        popup="YOUR LOCATION", 
+                        icon=folium.Icon(color='red', icon='user')
+                    ).add_to(m_sos)
+                    
+                    # Find and add nearest police station
                     try:
-                        runner = InMemoryRunner(node=emergency_workflow)
-                        events = run_in_thread(runner.run_debug(f"User Location: {user_location}"))
+                        df_p = routing_service.police_df
+                        dist_sq = (df_p['Latitude'] - user_lat)**2 + (df_p['Longitude'] - user_lon)**2
+                        closest_p = df_p.loc[dist_sq.idxmin()]
+                        popup_p_html = f"""
+                        <div style="font-family: 'Outfit', sans-serif; font-size: 12px; width: 130px; padding: 2px; line-height: 1.2;">
+                            <strong style="color: #1E3A8A;">🚓 Police Station</strong><br/>
+                            <span style="color: #4B5563;">{closest_p['Police Station']}</span>
+                        </div>
+                        """
+                        folium.Marker(
+                            [closest_p['Latitude'], closest_p['Longitude']],
+                            popup=folium.Popup(popup_p_html, max_width=140),
+                            icon=folium.Icon(color='blue', icon='shield')
+                        ).add_to(m_sos)
+                    except:
+                        pass
                         
-                        output_event = next((e for e in reversed(events) if e.output is not None), None)
-                        res = output_event.output if output_event else None
-                    except Exception as agent_err:
-                        st.exception(agent_err)
-                        st.info("ℹ️ **Groq API Limit Reached**: Fetching nearby emergency services locally.")
-                        res = local_emergency_solver(user_location)
+                    # Find and add nearest metro station
+                    try:
+                        df_m = routing_service.location_df
+                        dist_sq = (df_m['Latitude'] - user_lat)**2 + (df_m['Longitude'] - user_lon)**2
+                        closest_m = df_m.loc[dist_sq.idxmin()]
+                        popup_m_html = f"""
+                        <div style="font-family: 'Outfit', sans-serif; font-size: 12px; width: 130px; padding: 2px; line-height: 1.2;">
+                            <strong style="color: #6D28D9;">🚇 Metro Station</strong><br/>
+                            <span style="color: #4B5563;">{closest_m['Station Names']}</span>
+                        </div>
+                        """
+                        folium.Marker(
+                            [closest_m['Latitude'], closest_m['Longitude']],
+                            popup=folium.Popup(popup_m_html, max_width=140),
+                            icon=folium.Icon(color='purple', icon='subway')
+                        ).add_to(m_sos)
+                    except:
+                        pass
                         
-                    if not res or not isinstance(res, dict):
-                        st.error("Emergency Agent did not return a valid response and local fallback failed.")
-                    else:
-                        # Wrap emergency information in a styled container
-                        st.markdown(f'<div class="sos-output-container">\n\n{res["emergency_info"]}\n\n</div>', unsafe_allow_html=True)
-                        
-                        # Let's geocode user location to render a map
-                        from geopy.geocoders import Nominatim
-                        geolocator = Nominatim(user_agent="safegrid")
-                        query = user_location if "delhi" in user_location.lower() else f"{user_location}, Delhi"
-                        geo = geolocator.geocode(query)
-                        
-                        if geo:
-                            user_lat, user_lon = geo.latitude, geo.longitude
-                            m_sos = folium.Map(location=[user_lat, user_lon], zoom_start=14)
-                            
-                            # User marker
-                            folium.Marker(
-                                [user_lat, user_lon], 
-                                popup="YOUR LOCATION", 
-                                icon=folium.Icon(color='red', icon='user')
-                            ).add_to(m_sos)
-                            
-                            # Find and add nearest police station
-                            try:
-                                df_p = routing_service.police_df
-                                dist_sq = (df_p['Latitude'] - user_lat)**2 + (df_p['Longitude'] - user_lon)**2
-                                closest_p = df_p.loc[dist_sq.idxmin()]
-                                popup_p_html = f"""
-                                <div style="font-family: 'Outfit', sans-serif; font-size: 12px; width: 130px; padding: 2px; line-height: 1.2;">
-                                    <strong style="color: #1E3A8A;">🚓 Police Station</strong><br/>
-                                    <span style="color: #4B5563;">{closest_p['Police Station']}</span>
-                                </div>
-                                """
-                                folium.Marker(
-                                    [closest_p['Latitude'], closest_p['Longitude']],
-                                    popup=folium.Popup(popup_p_html, max_width=140),
-                                    icon=folium.Icon(color='blue', icon='shield')
-                                ).add_to(m_sos)
-                            except:
-                                pass
-                                
-                            # Find and add nearest metro station
-                            try:
-                                df_m = routing_service.location_df
-                                dist_sq = (df_m['Latitude'] - user_lat)**2 + (df_m['Longitude'] - user_lon)**2
-                                closest_m = df_m.loc[dist_sq.idxmin()]
-                                popup_m_html = f"""
-                                <div style="font-family: 'Outfit', sans-serif; font-size: 12px; width: 130px; padding: 2px; line-height: 1.2;">
-                                    <strong style="color: #6D28D9;">🚇 Metro Station</strong><br/>
-                                    <span style="color: #4B5563;">{closest_m['Station Names']}</span>
-                                </div>
-                                """
-                                folium.Marker(
-                                    [closest_m['Latitude'], closest_m['Longitude']],
-                                    popup=folium.Popup(popup_m_html, max_width=140),
-                                    icon=folium.Icon(color='purple', icon='subway')
-                                ).add_to(m_sos)
-                            except:
-                                pass
-                                
-                            # Add hospital stub marker
-                            hospitals = [
-                                {"name": "Lok Nayak Hospital", "lat": 28.6366, "lon": 77.2407},
-                                {"name": "Dr. Ram Manohar Lohia Hospital", "lat": 28.6253, "lon": 77.2007},
-                                {"name": "AIIMS New Delhi", "lat": 28.5672, "lon": 77.2100},
-                                {"name": "Max Super Speciality Hospital, Shalimar Bagh", "lat": 28.7180, "lon": 77.1585},
-                                {"name": "Sir Ganga Ram Hospital", "lat": 28.6385, "lon": 77.1895}
-                            ]
-                            closest_h = min(hospitals, key=lambda h: (h['lat'] - user_lat)**2 + (h['lon'] - user_lon)**2)
-                            popup_h_html = f"""
-                            <div style="font-family: 'Outfit', sans-serif; font-size: 12px; width: 130px; padding: 2px; line-height: 1.2;">
-                                <strong style="color: #047857;">🏥 Hospital</strong><br/>
-                                <span style="color: #4B5563;">{closest_h['name']}</span>
-                            </div>
-                            """
-                            folium.Marker(
-                                [closest_h['lat'], closest_h['lon']],
-                                popup=folium.Popup(popup_h_html, max_width=140),
-                                icon=folium.Icon(color='green', icon='plus-sign')
-                            ).add_to(m_sos)
-                            
-                            
-                            st.markdown('<div class="custom-card" style="padding: 1.5rem 1.5rem 0.5rem 1.5rem;"><div class="insight-header">🗺️ Nearest Services Map</div>', unsafe_allow_html=True)
-                            st_folium(
-                                m_sos,
-                                width=None,
-                                height=450,
-                                returned_objects=[],
-                                key="sos_map",
-                                use_container_width=True
-                            )
-                            st.markdown('</div>', unsafe_allow_html=True)
-                except Exception as e:
-                    st.error(f"Error during SOS retrieval: {e}")
+                    # Add hospital stub marker
+                    hospitals = [
+                        {"name": "Lok Nayak Hospital", "lat": 28.6366, "lon": 77.2407},
+                        {"name": "Dr. Ram Manohar Lohia Hospital", "lat": 28.6253, "lon": 77.2007},
+                        {"name": "AIIMS New Delhi", "lat": 28.5672, "lon": 77.2100},
+                        {"name": "Max Super Speciality Hospital, Shalimar Bagh", "lat": 28.7180, "lon": 77.1585},
+                        {"name": "Sir Ganga Ram Hospital", "lat": 28.6385, "lon": 77.1895}
+                    ]
+                    closest_h = min(hospitals, key=lambda h: (h['lat'] - user_lat)**2 + (h['lon'] - user_lon)**2)
+                    popup_h_html = f"""
+                    <div style="font-family: 'Outfit', sans-serif; font-size: 12px; width: 130px; padding: 2px; line-height: 1.2;">
+                        <strong style="color: #047857;">🏥 Hospital</strong><br/>
+                        <span style="color: #4B5563;">{closest_h['name']}</span>
+                    </div>
+                    """
+                    folium.Marker(
+                        [closest_h['lat'], closest_h['lon']],
+                        popup=folium.Popup(popup_h_html, max_width=140),
+                        icon=folium.Icon(color='green', icon='plus-sign')
+                    ).add_to(m_sos)
+                    
+                    st.markdown('<div class="custom-card" style="padding: 1.5rem 1.5rem 0.5rem 1.5rem;"><div class="insight-header">🗺️ Nearest Services Map</div>', unsafe_allow_html=True)
+                    st_folium(
+                        m_sos,
+                        width=None,
+                        height=450,
+                        returned_objects=[],
+                        key="sos_map",
+                        use_container_width=True
+                    )
+                    st.markdown('</div>', unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Error during SOS retrieval: {e}")

@@ -39,6 +39,16 @@ routing_service = RoutingService(
 
 # 2. Deterministic Workflow Nodes
 
+def parse_coords(text: str):
+    """Parses coordinates in the format 'lat, lon' from a text string."""
+    match = re.search(r"([+-]?\d+\.\d+),\s*([+-]?\d+\.\d+)", text)
+    if match:
+        try:
+            return float(match.group(1)), float(match.group(2))
+        except ValueError:
+            pass
+    return None
+
 def route_planner_node(ctx: Context, node_input: str) -> str:
     # Extract source and destination
     source = "IGDTUW"
@@ -48,26 +58,45 @@ def route_planner_node(ctx: Context, node_input: str) -> str:
         source = match.group(1).strip()
         destination = match.group(2).strip()
         
-    from geopy.geocoders import Nominatim
-    geolocator = Nominatim(user_agent="safegrid")
-    
-    # Geocode start
-    query_start = source if "delhi" in source.lower() else f"{source}, Delhi"
-    try:
-        geo_start = geolocator.geocode(query_start)
-        if not geo_start:
-            raise ValueError(f"Source location '{source}' not found")
-    except Exception as e:
-        raise ValueError(f"Failed to geocode source '{source}': {str(e)}")
+    # Check if source contains coordinates
+    parsed_start = parse_coords(source)
+    if parsed_start:
+        class GeoLocationStart:
+            def __init__(self, lat, lon):
+                self.latitude = lat
+                self.longitude = lon
+        geo_start = GeoLocationStart(parsed_start[0], parsed_start[1])
+    else:
+        from geopy.geocoders import Nominatim
+        geolocator = Nominatim(user_agent="safegrid")
+        # Geocode start
+        query_start = source if "delhi" in source.lower() else f"{source}, Delhi"
+        try:
+            geo_start = geolocator.geocode(query_start)
+            if not geo_start:
+                raise ValueError(f"Source location '{source}' not found")
+        except Exception as e:
+            raise ValueError(f"Failed to geocode source '{source}': {str(e)}")
         
-    # Geocode end
-    query_end = destination if "delhi" in destination.lower() else f"{destination}, Delhi"
-    try:
-        geo_end = geolocator.geocode(query_end)
-        if not geo_end:
-            raise ValueError(f"Destination location '{destination}' not found")
-    except Exception as e:
-        raise ValueError(f"Failed to geocode destination '{destination}': {str(e)}")
+    # Check if destination contains coordinates
+    parsed_end = parse_coords(destination)
+    if parsed_end:
+        class GeoLocationEnd:
+            def __init__(self, lat, lon):
+                self.latitude = lat
+                self.longitude = lon
+        geo_end = GeoLocationEnd(parsed_end[0], parsed_end[1])
+    else:
+        from geopy.geocoders import Nominatim
+        geolocator = Nominatim(user_agent="safegrid")
+        # Geocode end
+        query_end = destination if "delhi" in destination.lower() else f"{destination}, Delhi"
+        try:
+            geo_end = geolocator.geocode(query_end)
+            if not geo_end:
+                raise ValueError(f"Destination location '{destination}' not found")
+        except Exception as e:
+            raise ValueError(f"Failed to geocode destination '{destination}': {str(e)}")
         
     res = routing_service.find_safest_route(
         geo_start.latitude, geo_start.longitude,
@@ -194,17 +223,21 @@ def geocode_node(ctx: Context, node_input: str) -> str:
     if match:
         location = match.group(1).strip()
         
-    from geopy.geocoders import Nominatim
-    geolocator = Nominatim(user_agent="safegrid")
-    query_loc = location if "delhi" in location.lower() else f"{location}, Delhi"
-    try:
-        geo_loc = geolocator.geocode(query_loc)
-        if not geo_loc:
+    parsed_loc = parse_coords(location)
+    if parsed_loc:
+        lat, lon = parsed_loc
+    else:
+        from geopy.geocoders import Nominatim
+        geolocator = Nominatim(user_agent="safegrid")
+        query_loc = location if "delhi" in location.lower() else f"{location}, Delhi"
+        try:
+            geo_loc = geolocator.geocode(query_loc)
+            if not geo_loc:
+                lat, lon = 28.6304, 77.2177
+            else:
+                lat, lon = geo_loc.latitude, geo_loc.longitude
+        except Exception:
             lat, lon = 28.6304, 77.2177
-        else:
-            lat, lon = geo_loc.latitude, geo_loc.longitude
-    except Exception:
-        lat, lon = 28.6304, 77.2177
         
     coords = {"lat": lat, "lon": lon, "location_name": location}
     coords_str = json.dumps(coords)
